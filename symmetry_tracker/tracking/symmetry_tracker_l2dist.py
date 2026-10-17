@@ -32,18 +32,53 @@ def TracksCentroidL2(Array1, Array2, dt):
     return np.mean(distances)
 
 
+def CentroidL2(Centroids1, Centroids2, dt):
+  """
+  TracksCentroidL2(Array1, Array2, dt) from the centroids (CenterMass) of the channels of the two local
+  tracks.
+  """
+  if len(Centroids1) != len(Centroids2):
+    raise Exception(f"Channel counts of the two local tracks ({len(Centroids1)} and {len(Centroids2)}) must be the same")
+
+  centroids1 = []
+  centroids2 = []
+  for centroid1, centroid2 in zip(Centroids1[dt:], Centroids2[:-dt]):
+    if None in centroid1 or None in centroid2:
+      continue
+    centroids1.append(centroid1)
+    centroids2.append(centroid2)
+
+  distances = [np.linalg.norm(np.array(c1) - np.array(c2)) for c1, c2 in zip(centroids1, centroids2)]
+  if len(distances) == 0:
+    return float('inf')
+  return np.mean(distances)
+
+
 class CentroidL2Similarity(MinimizeDistance):
   """
-  The metric of GlobalAssignment_L2Distance: the mean centroid distance of the local tracks, for the
-  pairs whose TrackBbox centers are closer than MaxDistance. Every later track is decoded at most once
-  per pair of frames.
+  The metric of GlobalAssignment_L2Distance: the mean centroid distance of the local tracks
+  (TracksCentroidL2), for the pairs whose TrackBbox centers are closer than MaxDistance, computed by
+  CentroidL2 from the channel centroids that Prepare stores on every record.
   """
+
+  def Prepare(self, Record, LocalTrack):
+    Record["LocalTrackCentroids"] = [CenterMass(Channel) for Channel in LocalTrack]
+
+  def Release(self, Record):
+    Record["LocalTrackCentroids"] = None
+
+  @staticmethod
+  def CentroidsOf(Record):
+    """The channel centroids of a record, computed from its LocalTrackRLE if Prepare did not run on it."""
+    Centroids = Record.get("LocalTrackCentroids")
+    if Centroids is None:
+      Centroids = [CenterMass(Channel) for Channel in DecodeMultiRLE(Record["LocalTrackRLE"])]
+      Record["LocalTrackCentroids"] = Centroids
+    return Centroids
 
   def ScoreMatrix(self, T0, Tdt, dt):
     Matrix = np.full((len(T0), len(Tdt)), self.MaxDistance, dtype=float)
-    Decoded = {}
     for i, Record0 in enumerate(T0):
-      LTR0 = DecodeMultiRLE(Record0["LocalTrackRLE"])
       for j, RecordDt in enumerate(Tdt):
         bbox0 = np.array(Record0["TrackBbox"])
         bboxdt = np.array(RecordDt["TrackBbox"])
@@ -51,9 +86,7 @@ class CentroidL2Similarity(MinimizeDistance):
         bboxdt_ctr = (bboxdt[:2] + bboxdt[2:]) / 2
         bbox_distance = np.linalg.norm(bbox0_ctr - bboxdt_ctr)
         if bbox_distance < self.MaxDistance:
-          if j not in Decoded:
-            Decoded[j] = DecodeMultiRLE(RecordDt["LocalTrackRLE"])
-          Matrix[i, j] = TracksCentroidL2(LTR0, Decoded[j], dt)
+          Matrix[i, j] = CentroidL2(self.CentroidsOf(Record0), self.CentroidsOf(RecordDt), dt)
     return Matrix
 
 
