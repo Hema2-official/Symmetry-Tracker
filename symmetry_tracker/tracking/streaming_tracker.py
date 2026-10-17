@@ -43,7 +43,15 @@ def TracksIOU_RLE(RLEs1, Areas1, RLEs2, Areas2, dt):
   return Intersection / Union
 
 
-class MaximizeSimilarity:
+class SimilarityMetric:
+  def Prepare(self, Record, LocalTrack):
+    pass
+
+  def Release(self, Record):
+    pass
+
+
+class MaximizeSimilarity(SimilarityMetric):
   """
   The matching rule of GlobalAssignment. A metric subclass fills the similarity matrix of two frames
   (ScoreMatrix); the pairs below MinRequiredSimilarity count as 0 for the Hungarian method, and an
@@ -64,7 +72,7 @@ class MaximizeSimilarity:
     return Value >= self.MinRequiredSimilarity
 
 
-class MinimizeDistance:
+class MinimizeDistance(SimilarityMetric):
   """
   The matching rule of GlobalAssignment_L2Distance. A metric subclass fills the distance matrix of two
   frames (ScoreMatrix), with MaxDistance for the pairs it does not score, and an assigned pair is linked
@@ -97,10 +105,11 @@ class TrackIoUSimilarity(MaximizeSimilarity):
     return Matrix
 
 
-def LocalTrackFrame(Frames, Frame, FrameRecords, Kernel, TimeKernelSize):
+def LocalTrackFrame(Frames, Frame, FrameRecords, Kernel, TimeKernelSize, Similarity=None):
   """
   The local track of every object of one frame: LocalTrackRLE, the pixel counts of its channels
-  (LocalTrackAreas, from the encodings) and TrackBbox. The kernel runs once per object, as in LocalTracking.
+  (LocalTrackAreas, from the encodings) and TrackBbox, plus what the Similarity stores on the record
+  (SimilarityMetric.Prepare). The kernel runs once per object, as in LocalTracking.
   """
   if not FrameRecords:
     return
@@ -110,6 +119,8 @@ def LocalTrackFrame(Frames, Frame, FrameRecords, Kernel, TimeKernelSize):
     Record["LocalTrackRLE"] = EncodeMultiRLE(LocalTrack)
     Record["LocalTrackAreas"] = [int(Area) for Area in coco_mask.area(Record["LocalTrackRLE"])]
     Record["TrackBbox"] = OuterBoundingBox(LocalTrack)
+    if Similarity is not None:
+      Similarity.Prepare(Record, LocalTrack)
 
 
 def AssignFramePair(T0Records, TdtRecords, dt, Similarity):
@@ -164,6 +175,7 @@ def StreamingTracking(Frames, FrameGroups, Kernel, TimeKernelSize, Similarity,
   def Evict(Old):
     for Record in Window.pop(Old, []):
       Record["LocalTrackRLE"] = None   # only needed while the frame is in the window
+      Similarity.Release(Record)
 
   print("Streaming tracking")
   with RecordCollector(OutputPath) as Collector:
@@ -173,7 +185,7 @@ def StreamingTracking(Frames, FrameGroups, Kernel, TimeKernelSize, Similarity,
         Records = NextGroup[1]
         NextGroup = next(Groups, None)
 
-      LocalTrackFrame(Frames, Frame, Records, Kernel, TimeKernelSize)
+      LocalTrackFrame(Frames, Frame, Records, Kernel, TimeKernelSize, Similarity)
       Window[Frame] = Records
 
       NewLinks = []

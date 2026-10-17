@@ -1,5 +1,6 @@
 import time
 import numpy as np
+from pycocotools import mask as coco_mask
 from scipy.optimize import linear_sum_assignment
 
 from symmetry_tracker.general_functionalities.misc_utilities import CenterMass, shift_2d_replace, DecodeMultiRLE
@@ -14,46 +15,121 @@ except:
   pass
 
 def TracksIOU_ShapeDistance(Array1, Array2, dt):
-    if Array1.shape != Array2.shape:
-        raise Exception(f"Dimensions of Array1 {Array1.shape} and Array2 {Array2.shape} must be the same")
+  """
+  The 3D IoU of the channel pairs (dt+i, i), channel i of Array2 shifted by the centroid difference of
+  the pair. A pair with an empty channel (no centroid) is compared unshifted.
+  """
+  if Array1.shape != Array2.shape:
+    raise Exception(f"Dimensions of Array1 {Array1.shape} and Array2 {Array2.shape} must be the same")
 
-    centroids1 = []
-    centroids2 = []
-    for seg1, seg2 in zip(Array1[dt:], Array2[:-dt]):
-        centroid1 = CenterMass(seg1)
-        centroid2 = CenterMass(seg2)
-        if None in centroid1 or None in centroid2:
-            continue
-        centroids1.append(centroid1)
-        centroids2.append(centroid2)
+  rolled_Array2 = np.zeros_like(Array2)
+  for i, (seg1, seg2) in enumerate(zip(Array1[dt:], Array2[:-dt])):
+    centroid1 = CenterMass(seg1)
+    centroid2 = CenterMass(seg2)
+    if None in centroid1 or None in centroid2:
+      rolled_Array2[i] = seg2
+    else:
+      rolled_Array2[i] = shift_2d_replace(seg2, centroid1[0] - centroid2[0], centroid1[1] - centroid2[1])
 
-    centroid_diff = np.array(centroids1) - np.array(centroids2)
+  return TracksIOU(Array1, rolled_Array2, dt)
 
-    rolled_Array2 = np.zeros_like(Array2)
-    for (dx, dy), seg2 in zip(centroid_diff, Array2[:-dt]):
-        rolled_seg2 = shift_2d_replace(seg2, dx, dy)
-        rolled_Array2 += rolled_seg2
 
-    return TracksIOU(Array1, rolled_Array2, dt)
+class ShapeTrack:
+  """
+  What ShapeIoU needs of one local track, computed once per object: the centroid (CenterMass) and the
+  bounding box (y0, y1, x0, x1; None if empty) of every channel, and the track cropped to the box around
+  all of its channels, with the offset (Y0, X0) of the crop in the frame.
+  """
+  __slots__ = ("Height", "Width", "Centroids", "Boxes", "Y0", "X0", "Crop")
+
+  def __init__(self, LocalTrack, LocalTrackRLE):
+    self.Height, self.Width = LocalTrack.shape[1], LocalTrack.shape[2]
+    self.Centroids = [CenterMass(Channel) for Channel in LocalTrack]
+    self.Boxes = []
+    for x, y, w, h in coco_mask.toBbox(LocalTrackRLE):
+      self.Boxes.append((int(y), int(y+h), int(x), int(x+w)) if w > 0 and h > 0 else None)
+    Boxes = [Box for Box in self.Boxes if Box is not None]
+    if Boxes:
+      self.Y0, Y1 = min(Box[0] for Box in Boxes), max(Box[1] for Box in Boxes)
+      self.X0, X1 = min(Box[2] for Box in Boxes), max(Box[3] for Box in Boxes)
+    else:
+      self.Y0, Y1, self.X0, X1 = 0, 0, 0, 0
+    self.Crop = np.array(LocalTrack[:, self.Y0:Y1, self.X0:X1], dtype=bool)
+
+
+def ShapeIoU(Track1, Areas1, Track2, dt):
+  """
+  TracksIOU_ShapeDistance(Array1, Array2, dt) from the ShapeTracks of the two local tracks (Areas1: the
+  pixel counts of the channels of Array1). S_i is channel i of Array2 shifted and clipped to the frame;
+  its intersection with A_i = Array1[dt+i] is counted inside the overlap of their boxes, and the union
+  is sum_i |A_i| + sum_i |S_i| - intersection.
+  """
+  Height, Width = Track1.Height, Track1.Width
+  Intersection = ShiftedArea = 0
+  for i in range(len(Track1.Centroids) - dt):
+    Box2 = Track2.Boxes[i]
+    if Box2 is None:
+      continue
+    Centroid1, Centroid2 = Track1.Centroids[dt+i], Track2.Centroids[i]
+    if None in Centroid1 or None in Centroid2:
+      dx, dy = 0, 0
+    else:
+      dx, dy = Centroid1[0] - Centroid2[0], Centroid1[1] - Centroid2[1]
+    y0, y1 = max(Box2[0]+dy, 0), min(Box2[1]+dy, Height)
+    x0, x1 = max(Box2[2]+dx, 0), min(Box2[3]+dx, Width)
+    if y0 >= y1 or x0 >= x1:
+      continue
+    # S_i on [y0, y1) x [x0, x1)
+    Shifted = Track2.Crop[i, y0-dy-Track2.Y0:y1-dy-Track2.Y0, x0-dx-Track2.X0:x1-dx-Track2.X0]
+    ShiftedArea += int(np.count_nonzero(Shifted))
+    Box1 = Track1.Boxes[dt+i]
+    if Box1 is None:
+      continue
+    iy0, iy1 = max(Box1[0], y0), min(Box1[1], y1)
+    ix0, ix1 = max(Box1[2], x0), min(Box1[3], x1)
+    if iy0 < iy1 and ix0 < ix1:
+      Intersection += int(np.count_nonzero(np.logical_and(
+          Track1.Crop[dt+i, iy0-Track1.Y0:iy1-Track1.Y0, ix0-Track1.X0:ix1-Track1.X0],
+          Shifted[iy0-y0:iy1-y0, ix0-x0:ix1-x0])))
+  Union = sum(Areas1[dt:]) + ShiftedArea - Intersection
+  if Union == 0:
+    return 0
+  return Intersection / Union
 
 
 class ShapeIoUSimilarity(MaximizeSimilarity):
   """
   The metric of GlobalAssignment_ShapeDistance: the IoU of the local tracks after aligning their
-  centroids, for every candidate pair. Every later track is decoded once per pair of frames.
+  centroids (TracksIOU_ShapeDistance), computed by ShapeIoU from the ShapeTrack that Prepare stores on
+  every record.
   """
+
+  def Prepare(self, Record, LocalTrack):
+    Record["LocalTrackShape"] = ShapeTrack(LocalTrack, Record["LocalTrackRLE"])
+
+  def Release(self, Record):
+    Record["LocalTrackShape"] = None
+
+  @staticmethod
+  def ShapeOf(Record):
+    """The ShapeTrack of a record, computed from its LocalTrackRLE if Prepare did not run on it."""
+    Shape = Record.get("LocalTrackShape")
+    if Shape is None:
+      Shape = ShapeTrack(DecodeMultiRLE(Record["LocalTrackRLE"]), Record["LocalTrackRLE"])
+      Record["LocalTrackShape"] = Shape
+    return Shape
 
   def ScoreMatrix(self, T0, Tdt, dt):
     Matrix = np.zeros((len(T0), len(Tdt)))
-    Decoded = [DecodeMultiRLE(Record["LocalTrackRLE"]) for Record in Tdt]
+    Shapes = [self.ShapeOf(Record) for Record in Tdt]
     for i, Record0 in enumerate(T0):
-      LTR0 = DecodeMultiRLE(Record0["LocalTrackRLE"])
-      for j, LTRdt in enumerate(Decoded):
-        Matrix[i, j] = TracksIOU_ShapeDistance(LTR0, LTRdt, dt)
+      Shape0, Areas0 = self.ShapeOf(Record0), Record0["LocalTrackAreas"]
+      for j, ShapeDt in enumerate(Shapes):
+        Matrix[i, j] = ShapeIoU(Shape0, Areas0, ShapeDt, dt)
     return Matrix
 
 
-# Reference implementation (whole video in memory), kept for comparison; the entry point below does not use it.
+# Reference implementation (whole video in memory); the entry point below does not use it.
 def GlobalAssignment_ShapeDistance(VideoPath, VideoShape, AnnotDF, TimeKernelSize, MinRequiredSimilarity=0.5, MaxTimeKernelShift=None):
 
   VideoFrames = ListVideoFrames(VideoPath)
