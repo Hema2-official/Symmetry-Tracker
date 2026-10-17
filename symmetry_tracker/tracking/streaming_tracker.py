@@ -209,7 +209,7 @@ def StreamingTracking(Frames, FrameGroups, Kernel, TimeKernelSize, Similarity,
 
 def SymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize, Color, Marker, SegmentationConfidence, Similarity,
                      MaxTimeKernelShift=None, FaultyObjectRemoval=True, MinObjectPixelNumber=20, MaxOverlapRatio=0.5,
-                     OutputPath=None):
+                     OutputPath=None, ModelOptimization="fast"):
   """
   The common body of the SingleVideoSymmetryTracking* entry points: opens the video and the annotation,
   loads the model into a TrackingKernel and runs StreamingTracking with the given Similarity. The
@@ -221,7 +221,7 @@ def SymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize, Co
   Groups = TrackingFrames(AnnotPath, Frames.VideoShape, FaultyObjectRemoval, MinObjectPixelNumber, MaxOverlapRatio)
   Model = LoadPretrainedModel(ModelPath, Device)
   Kernel = TrackingKernel(Model, Device, Frames.VideoShape, Frames.Channels, TimeKernelSize, Marker,
-                          SegmentationConfidence)
+                          SegmentationConfidence, ModelOptimization)
   Result = StreamingTracking(Frames, Groups, Kernel, TimeKernelSize, Similarity, MaxTimeKernelShift, OutputPath)
   del Kernel, Model
   gc.collect()

@@ -227,7 +227,7 @@ def SingleVideoSymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKer
                               Color = "GRAYSCALE", Marker = "CENTROID", SegmentationConfidence = 0.1,
                               MinRequiredSimilarity=0.5, MaxTimeKernelShift=None,
                               FaultyObjectRemoval = True, MinObjectPixelNumber=20, MaxOverlapRatio=0.5,
-                              OutputPath=None):
+                              OutputPath=None, ModelOptimization="fast"):
   """
   - VideoPath: The path to video in stardard .png images format on which the tracking will be performed
   - ModelPath: The path to the pretrained model (the full model definition, not just the state dictionary)
@@ -260,9 +260,15 @@ def SingleVideoSymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKer
   - OutputPath: Optional .json / .jsonl path. If given, the results are written there frame by frame as they
                 become final and None is returned, so the memory needed does not depend on the video length.
                 Otherwise the AnnotDF of the whole video is returned.
+  - ModelOptimization: How the model is prepared for inference (see tracking/kernel.py).
+                       "fast" (default): batch norms folded into the convolutions and mkldnn layouts
+                       (torch.jit.optimize_for_inference), about 25% faster on CPU. The logits differ from the model
+                       as loaded by float rounding, so a local track may differ at a pixel lying exactly at
+                       SegmentationConfidence (none did on the sample videos; the local tracks themselves are not exported).
+                       "none": the model as loaded, the reference computation.
 
   The video is processed frame by frame with a bounded window (see streaming_tracker).
   """
   return SymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize, Color, Marker, SegmentationConfidence,
                           TrackIoUSimilarity(MinRequiredSimilarity), MaxTimeKernelShift,
-                          FaultyObjectRemoval, MinObjectPixelNumber, MaxOverlapRatio, OutputPath)
+                          FaultyObjectRemoval, MinObjectPixelNumber, MaxOverlapRatio, OutputPath, ModelOptimization)

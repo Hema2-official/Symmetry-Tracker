@@ -140,7 +140,7 @@ def SingleVideoSymmetryTracking_L2Distance(VideoPath, ModelPath, Device, AnnotPa
                               Color = "GRAYSCALE", Marker = "CENTROID", SegmentationConfidence = 0.1,
                               MaxCentroidDistance=20, MaxTimeKernelShift=None,
                               FaultyObjectRemoval = True, MinObjectPixelNumber=20, MaxOverlapRatio=0.5,
-                              OutputPath=None):
+                              OutputPath=None, ModelOptimization="fast"):
   """
   - VideoPath: The path to video in stardard .png images format on which the tracking will be performed
   - ModelPath: The path to the pretrained model (the full model definition, not just the state dictionary)
@@ -170,8 +170,8 @@ def SingleVideoSymmetryTracking_L2Distance(VideoPath, ModelPath, Device, AnnotPa
                       The maximal overlap allowed between annotations in the original annotation.
                       Above MaxOverlapRatio, the area-wise smaller Object will be removed.
                       Not an important parameter if the segmentation is more or less a partitioning
-  - OutputPath: as in SingleVideoSymmetryTracking
+  - OutputPath, ModelOptimization: as in SingleVideoSymmetryTracking
   """
   return SymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize, Color, Marker, SegmentationConfidence,
                           CentroidL2Similarity(MaxCentroidDistance), MaxTimeKernelShift,
-                          FaultyObjectRemoval, MinObjectPixelNumber, MaxOverlapRatio, OutputPath)
+                          FaultyObjectRemoval, MinObjectPixelNumber, MaxOverlapRatio, OutputPath, ModelOptimization)
