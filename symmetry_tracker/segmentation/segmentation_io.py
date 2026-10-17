@@ -4,6 +4,8 @@ import os
 from pycocotools import mask as coco_mask
 import matplotlib.pyplot as plt
 
+from symmetry_tracker.general_functionalities.video_io import ListVideoFrames
+
 def DisplaySegmentation(VideoPath, AnnotDF, DisplayFrameNumber = True, DisplayPeriodicity = 1, Figsize=(4,4)):
   """
   Displays the segmentation in AnnotDF onto the video at VideoPath
@@ -16,7 +18,7 @@ def DisplaySegmentation(VideoPath, AnnotDF, DisplayFrameNumber = True, DisplayPe
                         Minimal possible value=1.
   - Figsize: The shape of the figure in standard matplotlib format
   """
-  VideoFrames = sorted(os.listdir(VideoPath))
+  VideoFrames = ListVideoFrames(VideoPath)
   for Frame in range(len(VideoFrames)):
     if np.mod(Frame,DisplayPeriodicity)==0:
 

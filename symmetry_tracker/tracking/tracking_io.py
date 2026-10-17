@@ -9,6 +9,7 @@ import matplotlib.cm as cm
 
 from symmetry_tracker.general_functionalities.misc_utilities import fig2data
 from symmetry_tracker.general_functionalities.misc_utilities import CenterMass, BoundingBox
+from symmetry_tracker.general_functionalities.video_io import ListVideoFrames
 
 try:
   from IPython.display import display
@@ -64,7 +65,7 @@ def DisplayTracks(VideoPath, AnnotDF, DisplayFrameNumber = True, DisplaySegmenta
                         Minimal possible value=1.
   - Figsize: The shape of the figure in standard matplotlib format
   """
-  VideoFrames = sorted(os.listdir(VideoPath))
+  VideoFrames = ListVideoFrames(VideoPath)
   for Frame in range(len(VideoFrames)):
     if np.mod(Frame,DisplayPeriodicity)==0:
 
@@ -117,7 +118,7 @@ def SaveTracksVideo(VideoPath, AnnotDF, OutputVideoPath,
   if OutputVideoPath[-4:]!=".mp4":
     raise Exception("Only video paths with mp4 extension are allowed")
 
-  VideoFrames = sorted(os.listdir(VideoPath))
+  VideoFrames = ListVideoFrames(VideoPath)
   if StartingFrame is None:
     StartingFrame = 1
   if EndingFrame is None:

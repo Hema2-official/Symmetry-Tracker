@@ -1,10 +1,12 @@
 import numpy as np
 import cv2
-import pandas as pd
 import os
 from pycocotools import mask as coco_mask
 from detectron2.config import get_cfg
 from detectron2.engine import DefaultPredictor
+
+from symmetry_tracker.general_functionalities.video_io import ListVideoFrames
+from symmetry_tracker.general_functionalities.io_utilities import RecordsToDataFrame
 
 try:
   from IPython.display import display
@@ -13,7 +15,7 @@ except:
   pass
 
 def PerformSegmentation(Predictor, VideoPath, Color = "GRAYSCALE", MinObjectSize = None):
-  VideoFrames = sorted(os.listdir(VideoPath))
+  VideoFrames = ListVideoFrames(VideoPath)
   Outmasks = {}
 
   NumFrames = len(VideoFrames)
@@ -50,20 +52,18 @@ def PerformSegmentation(Predictor, VideoPath, Color = "GRAYSCALE", MinObjectSize
   return Outmasks
 
 def MasksToAnnot(Outmasks):
-  AnnotDF = pd.DataFrame(columns = ["Frame", "ObjectID", "SegmentationRLE", "TrackID",
-                                    "Interpolated", "Class", "AncestorID"])
-
+  """The segmentation AnnotDF of the masks (linear time: built in one go)."""
+  Records = []
   for Frame in Outmasks:
     NewObjectID = 1
     for SegmentationRLE in Outmasks[Frame]:
       FullObjectID = "{:04d}".format(Frame)+"{:04d}".format(NewObjectID)
-      AnnotRow = pd.Series({"Frame": Frame, "ObjectID": FullObjectID, "SegmentationRLE": SegmentationRLE, "TrackID": None,
-                            "Interpolated": False, "Class": None, "AncestorID": None})
-      
-      AnnotDF = pd.concat([AnnotDF, AnnotRow.to_frame().T], ignore_index=True)
+      Records.append({"Frame": Frame, "ObjectID": FullObjectID, "SegmentationRLE": SegmentationRLE, "TrackID": None,
+                      "Interpolated": False, "Class": None, "AncestorID": None})
       NewObjectID+=1
-      
-  return AnnotDF
+
+  return RecordsToDataFrame(Records, ["Frame", "ObjectID", "SegmentationRLE", "TrackID",
+                                      "Interpolated", "Class", "AncestorID"])
 
 def SingleVideoSegmentation(VideoPath, ModelPath, ModelConfigPath, Device, Color = "GRAYSCALE", ScoreThreshold = 0.2, MinObjectSize = 20):
   """

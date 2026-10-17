@@ -1,16 +1,11 @@
 import time
-import cv2
-import os
 import numpy as np
-import gc
 from scipy.optimize import linear_sum_assignment
 
 from symmetry_tracker.general_functionalities.misc_utilities import CenterMass, shift_2d_replace, DecodeMultiRLE
+from symmetry_tracker.general_functionalities.video_io import ListVideoFrames
 from symmetry_tracker.tracking.tracker_metrics import TracksIOU
-from symmetry_tracker.tracking.tracker_utilities import TransformToTrackingAnnot, RemoveFaultyObjects, LoadPretrainedModel
-from symmetry_tracker.general_functionalities.io_utilities import LoadAnnotJSON
-from symmetry_tracker.tracking.symmetry_tracker import LocalTracking, ConnectedIDReduction
-from symmetry_tracker.tracking.post_processing import InterpolateMissingObjects
+from symmetry_tracker.tracking.streaming_tracker import SymmetryTracking, MaximizeSimilarity
 
 try:
   from IPython.display import display
@@ -41,9 +36,27 @@ def TracksIOU_ShapeDistance(Array1, Array2, dt):
 
     return TracksIOU(Array1, rolled_Array2, dt)
 
+
+class ShapeIoUSimilarity(MaximizeSimilarity):
+  """
+  The metric of GlobalAssignment_ShapeDistance: the IoU of the local tracks after aligning their
+  centroids, for every candidate pair. Every later track is decoded once per pair of frames.
+  """
+
+  def ScoreMatrix(self, T0, Tdt, dt):
+    Matrix = np.zeros((len(T0), len(Tdt)))
+    Decoded = [DecodeMultiRLE(Record["LocalTrackRLE"]) for Record in Tdt]
+    for i, Record0 in enumerate(T0):
+      LTR0 = DecodeMultiRLE(Record0["LocalTrackRLE"])
+      for j, LTRdt in enumerate(Decoded):
+        Matrix[i, j] = TracksIOU_ShapeDistance(LTR0, LTRdt, dt)
+    return Matrix
+
+
+# Reference implementation (whole video in memory), kept for comparison; the entry point below does not use it.
 def GlobalAssignment_ShapeDistance(VideoPath, VideoShape, AnnotDF, TimeKernelSize, MinRequiredSimilarity=0.5, MaxTimeKernelShift=None):
 
-  VideoFrames = sorted(os.listdir(VideoPath))
+  VideoFrames = ListVideoFrames(VideoPath)
   NumFrames = len(VideoFrames)
 
   if MaxTimeKernelShift is None:
@@ -77,27 +90,12 @@ def GlobalAssignment_ShapeDistance(VideoPath, VideoShape, AnnotDF, TimeKernelSiz
           Tdt_ID = Tdt_IDs[j]
 
           #Removing bbox overlap based elimination as it is "unfair spatial information"
-          """
-          bbox0 = AnnotDF.query("ObjectID == @T0_ID")["TrackBbox"].iloc[0]
-          bboxdt = AnnotDF.query("ObjectID == @Tdt_ID")["TrackBbox"].iloc[0]
-          t00 = time.time()
-          overlap = BoxOverlap(bbox0, bboxdt)
-          if overlap != 0:
-          """
 
           LTRdt = DecodeMultiRLE(AnnotDF.query("ObjectID == @Tdt_ID")["LocalTrackRLE"].iloc[0])
           IOU = TracksIOU_ShapeDistance(LTR0, LTRdt, dt)
           SimilarityMatrix[i, j] = IOU
 
       SimilarityMatrix = SimilarityMatrix * (SimilarityMatrix >= MinRequiredSimilarity)
-
-      """
-      try:
-        sns.heatmap(SimilarityMatrix)
-        plt.show()
-      except:
-        pass
-      """
 
       # Hungarian Method based Assignment
 
@@ -116,10 +114,6 @@ def GlobalAssignment_ShapeDistance(VideoPath, VideoShape, AnnotDF, TimeKernelSiz
 
       t_end = time.time()
 
-      """
-      print(f"dt {dt}, Frame {Frame}, t_full {t_end-t0} s")
-      """
-
       try:
         ProgressBar.update(progress(len(AnnotDF.query("not NextID.isnull()")), len(AnnotDF)))
       except:
@@ -135,7 +129,8 @@ def GlobalAssignment_ShapeDistance(VideoPath, VideoShape, AnnotDF, TimeKernelSiz
 def SingleVideoSymmetryTracking_ShapeDistance(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize,
                               Color = "GRAYSCALE", Marker = "CENTROID", SegmentationConfidence = 0.1,
                               MinRequiredSimilarity=0.5, MaxTimeKernelShift=None,
-                              FaultyObjectRemoval = True, MinObjectPixelNumber=20, MaxOverlapRatio=0.5):
+                              FaultyObjectRemoval = True, MinObjectPixelNumber=20, MaxOverlapRatio=0.5,
+                              OutputPath=None):
   """
   - VideoPath: The path to video in stardard .png images format on which the tracking will be performed
   - ModelPath: The path to the pretrained model (the full model definition, not just the state dictionary)
@@ -165,31 +160,8 @@ def SingleVideoSymmetryTracking_ShapeDistance(VideoPath, ModelPath, Device, Anno
                       The maximal overlap allowed between annotations in the original annotation.
                       Above MaxOverlapRatio, the area-wise smaller Object will be removed.
                       Not an important parameter if the segmentation is more or less a partitioning
+  - OutputPath: as in SingleVideoSymmetryTracking
   """
-
-  if not Color in ["GRAYSCALE", "RGB"]:
-    raise Exception(f"{Color} is an invalid keyword for Color")
-  if not Marker in ["CENTROID", "BBOX"]:
-    raise Exception(f"{Marker} is not an appropriate keyword for Marker")
-
-  VideoFrames = sorted(os.listdir(VideoPath))
-  Img0 = cv2.imread(os.path.join(VideoPath,VideoFrames[0]))
-  VideoShape = [len(os.listdir(VideoPath)), np.shape(Img0)[0], np.shape(Img0)[1]]
-  AnnotDF = LoadAnnotJSON(AnnotPath)
-  AnnotDF = TransformToTrackingAnnot(AnnotDF)
-
-  if FaultyObjectRemoval:
-    AnnotDF = RemoveFaultyObjects(AnnotDF, VideoShape, MinObjectPixelNumber, MaxOverlapRatio)
-
-  Model = LoadPretrainedModel(ModelPath, Device)
-  AnnotDF = LocalTracking(VideoPath, VideoShape, AnnotDF, Model, Device, TimeKernelSize, Color, Marker, SegmentationConfidence)
-  del Model
-  gc.collect()
-
-  AnnotDF = GlobalAssignment_ShapeDistance(VideoPath, VideoShape, AnnotDF, TimeKernelSize, MinRequiredSimilarity, MaxTimeKernelShift)
-
-  AnnotDF = ConnectedIDReduction(AnnotDF)
-  
-  AnnotDF = InterpolateMissingObjects(AnnotDF)
-
-  return AnnotDF
+  return SymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize, Color, Marker, SegmentationConfidence,
+                          ShapeIoUSimilarity(MinRequiredSimilarity), MaxTimeKernelShift,
+                          FaultyObjectRemoval, MinObjectPixelNumber, MaxOverlapRatio, OutputPath)

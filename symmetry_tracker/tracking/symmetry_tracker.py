@@ -2,16 +2,13 @@ import time
 import cv2
 import os
 import numpy as np
-import torch
-import torch.nn.functional as F
-import gc
 from scipy.optimize import linear_sum_assignment
 
 from symmetry_tracker.general_functionalities.misc_utilities import EncodeMultiRLE, DecodeMultiRLE, OuterBoundingBox, BoxOverlap, dfs
+from symmetry_tracker.general_functionalities.video_io import ListVideoFrames
 from symmetry_tracker.tracking.tracker_metrics import TracksIOU
-from symmetry_tracker.tracking.tracker_utilities import TransformToTrackingAnnot, RemoveFaultyObjects, LoadPretrainedModel
-from symmetry_tracker.general_functionalities.io_utilities import LoadAnnotJSON
-from symmetry_tracker.tracking.post_processing import InterpolateMissingObjects
+from symmetry_tracker.tracking.kernel import KernelTrackCentroid, KernelTrackBbox
+from symmetry_tracker.tracking.streaming_tracker import SymmetryTracking, TrackIoUSimilarity
 
 try:
   from IPython.display import display
@@ -20,66 +17,10 @@ except:
   pass
 
 
-def KernelTrackCentroid(LocalVideo, VideoShape, Model, Device, SegmentationConfidence, ObjectCenter):
-  with torch.no_grad():
-    inputs = LocalVideo
-    CPImage = np.zeros([VideoShape[1],VideoShape[2]])
-    [CMy,CMx]=ObjectCenter
-    CPImage[CMx-2:CMx+2,CMy-2:CMy+2]=255
-    inputs = np.append(inputs, [CPImage], axis=0)
-    inputs = np.array(inputs, dtype=float)/255
-    inputs = torch.Tensor(np.array(inputs))
-
-    pad_h = (16 - inputs.shape[1] % 16) % 16
-    pad_w = (16 - inputs.shape[2] % 16) % 16
-    inputs = F.pad(inputs, (0, pad_w, 0, pad_h), mode='constant', value=0)
-
-    inputs=torch.unsqueeze(inputs, dim=0)
-
-    inputs=inputs.to(torch.device(Device))
-    output = np.array(torch.sigmoid(Model(inputs).cpu()))
-    output = output>SegmentationConfidence
-    output = output*1.0
-    output = np.nan_to_num(output, nan=0.0, posinf=1.0, neginf=0.0)
-
-    torch.cuda.empty_cache()
-
-    """
-    plt.imshow(output[0, 0, :, :])
-    plt.show()
-    """
-  return np.array(output[0], dtype = bool)
-
-def KernelTrackBbox(LocalVideo, VideoShape, Model, Device, SegmentationConfidence, ObjectBbox):
-  with torch.no_grad():
-    inputs = LocalVideo
-    BboxImg = np.zeros([VideoShape[1],VideoShape[2]])
-    [x0, y0, x1, y1] = ObjectBbox
-    BboxImg[x0:x1,y0:y1]=255
-    inputs = np.append(inputs, [BboxImg], axis=0)
-    inputs = np.array(inputs, dtype=float)/255
-    inputs = torch.Tensor(np.array(inputs))
-
-    pad_h = (16 - inputs.shape[1] % 16) % 16
-    pad_w = (16 - inputs.shape[2] % 16) % 16
-    inputs = F.pad(inputs, (0, pad_w, 0, pad_h), mode='constant', value=0)
-
-    inputs=torch.unsqueeze(inputs, dim=0)
-
-    inputs=inputs.to(torch.device(Device))
-    output = np.array(torch.sigmoid(Model(inputs).cpu()))
-    output = output>SegmentationConfidence
-    output = output*1.0
-    output = np.nan_to_num(output, nan=0.0, posinf=1.0, neginf=0.0)
-
-    torch.cuda.empty_cache()
-
-    """
-    plt.imshow(output[0, 0, :, :])
-    plt.show()
-    """
-  return np.array(output[0], dtype = bool)
-
+# ---------------------------------------------------------------------------------------------------
+# Reference implementation (whole video in memory). SingleVideoSymmetryTracking does not use these
+# any more; they are kept for comparison and for callers of the old step-by-step API.
+# ---------------------------------------------------------------------------------------------------
 
 def LocalTracking(VideoPath, VideoShape, AnnotDF, Model, Device, TimeKernelSize, Color = "GRAYSCALE", Marker = "CENTROID", SegmentationConfidence = 0.2):
 
@@ -88,7 +29,7 @@ def LocalTracking(VideoPath, VideoShape, AnnotDF, Model, Device, TimeKernelSize,
   if not Marker in ["CENTROID", "BBOX"]:
     raise Exception(f"{Marker} is not an appropriate keyword for Marker")
 
-  VideoFrames = sorted(os.listdir(VideoPath))
+  VideoFrames = ListVideoFrames(VideoPath)
   NumFrames = len(VideoFrames)
 
   print("Local Tracking")
@@ -162,7 +103,7 @@ def LocalTracking(VideoPath, VideoShape, AnnotDF, Model, Device, TimeKernelSize,
 
 def GlobalAssignment(VideoPath, VideoShape, AnnotDF, TimeKernelSize, MinRequiredSimilarity=0.5, MaxTimeKernelShift=None):
 
-  VideoFrames = sorted(os.listdir(VideoPath))
+  VideoFrames = ListVideoFrames(VideoPath)
   NumFrames = len(VideoFrames)
 
   if MaxTimeKernelShift is None:
@@ -206,11 +147,6 @@ def GlobalAssignment(VideoPath, VideoShape, AnnotDF, TimeKernelSize, MinRequired
 
       SimilarityMatrix = SimilarityMatrix * (SimilarityMatrix >= MinRequiredSimilarity)
 
-      """
-      sns.heatmap(SimilarityMatrix)
-      plt.show()
-      """
-
       # Hungarian Method based Assignment
 
       try:
@@ -227,10 +163,6 @@ def GlobalAssignment(VideoPath, VideoShape, AnnotDF, TimeKernelSize, MinRequired
           AnnotDF.loc[AnnotDF.query("ObjectID == @Tdt_ID").index, "PrevID"] = T0_ID
 
       t_end = time.time()
-
-      """
-      print(f"dt {dt}, Frame {Frame}, t_full {t_end-t0} s")
-      """
 
       try:
         ProgressBar.update(progress(len(AnnotDF.query("not NextID.isnull()")), len(AnnotDF)))
@@ -287,10 +219,15 @@ def ConnectedIDReduction(AnnotDF):
   return AnnotDF
 
 
+# ---------------------------------------------------------------------------------------------------
+# Public entry point (streaming implementation)
+# ---------------------------------------------------------------------------------------------------
+
 def SingleVideoSymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize,
                               Color = "GRAYSCALE", Marker = "CENTROID", SegmentationConfidence = 0.1,
                               MinRequiredSimilarity=0.5, MaxTimeKernelShift=None,
-                              FaultyObjectRemoval = True, MinObjectPixelNumber=20, MaxOverlapRatio=0.5):
+                              FaultyObjectRemoval = True, MinObjectPixelNumber=20, MaxOverlapRatio=0.5,
+                              OutputPath=None):
   """
   - VideoPath: The path to video in stardard .png images format on which the tracking will be performed
   - ModelPath: The path to the pretrained model (the full model definition, not just the state dictionary)
@@ -320,31 +257,12 @@ def SingleVideoSymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKer
                       The maximal overlap allowed between annotations in the original annotation.
                       Above MaxOverlapRatio, the area-wise smaller Object will be removed.
                       Not an important parameter if the segmentation is more or less a partitioning
+  - OutputPath: Optional .json / .jsonl path. If given, the results are written there frame by frame as they
+                become final and None is returned, so the memory needed does not depend on the video length.
+                Otherwise the AnnotDF of the whole video is returned.
+
+  The video is processed frame by frame with a bounded window (see streaming_tracker).
   """
-
-  if not Color in ["GRAYSCALE", "RGB"]:
-    raise Exception(f"{Color} is an invalid keyword for Color")
-  if not Marker in ["CENTROID", "BBOX"]:
-    raise Exception(f"{Marker} is not an appropriate keyword for Marker")
-
-  VideoFrames = sorted(os.listdir(VideoPath))
-  Img0 = cv2.imread(os.path.join(VideoPath,VideoFrames[0]))
-  VideoShape = [len(os.listdir(VideoPath)), np.shape(Img0)[0], np.shape(Img0)[1]]
-  AnnotDF = LoadAnnotJSON(AnnotPath)
-  AnnotDF = TransformToTrackingAnnot(AnnotDF)
-
-  if FaultyObjectRemoval:
-    AnnotDF = RemoveFaultyObjects(AnnotDF, VideoShape, MinObjectPixelNumber, MaxOverlapRatio)
-
-  Model = LoadPretrainedModel(ModelPath, Device)
-  AnnotDF = LocalTracking(VideoPath, VideoShape, AnnotDF, Model, Device, TimeKernelSize, Color, Marker, SegmentationConfidence)
-  del Model
-  gc.collect()
-
-  AnnotDF = GlobalAssignment(VideoPath, VideoShape, AnnotDF, TimeKernelSize, MinRequiredSimilarity, MaxTimeKernelShift)
-
-  AnnotDF = ConnectedIDReduction(AnnotDF)
-  
-  AnnotDF = InterpolateMissingObjects(AnnotDF)
-
-  return AnnotDF
+  return SymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize, Color, Marker, SegmentationConfidence,
+                          TrackIoUSimilarity(MinRequiredSimilarity), MaxTimeKernelShift,
+                          FaultyObjectRemoval, MinObjectPixelNumber, MaxOverlapRatio, OutputPath)

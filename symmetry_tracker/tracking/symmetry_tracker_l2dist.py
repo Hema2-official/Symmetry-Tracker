@@ -1,15 +1,10 @@
 import time
-import cv2
-import os
 import numpy as np
-import gc
 from scipy.optimize import linear_sum_assignment
 
 from symmetry_tracker.general_functionalities.misc_utilities import CenterMass, DecodeMultiRLE
-from symmetry_tracker.tracking.tracker_utilities import TransformToTrackingAnnot, RemoveFaultyObjects, LoadPretrainedModel
-from symmetry_tracker.general_functionalities.io_utilities import LoadAnnotJSON
-from symmetry_tracker.tracking.symmetry_tracker import LocalTracking, ConnectedIDReduction
-from symmetry_tracker.tracking.post_processing import InterpolateMissingObjects
+from symmetry_tracker.general_functionalities.video_io import ListVideoFrames
+from symmetry_tracker.tracking.streaming_tracker import SymmetryTracking, MinimizeDistance
 
 try:
   from IPython.display import display
@@ -36,9 +31,36 @@ def TracksCentroidL2(Array1, Array2, dt):
         return float('inf')
     return np.mean(distances)
 
+
+class CentroidL2Similarity(MinimizeDistance):
+  """
+  The metric of GlobalAssignment_L2Distance: the mean centroid distance of the local tracks, for the
+  pairs whose TrackBbox centers are closer than MaxDistance. Every later track is decoded at most once
+  per pair of frames.
+  """
+
+  def ScoreMatrix(self, T0, Tdt, dt):
+    Matrix = np.full((len(T0), len(Tdt)), self.MaxDistance, dtype=float)
+    Decoded = {}
+    for i, Record0 in enumerate(T0):
+      LTR0 = DecodeMultiRLE(Record0["LocalTrackRLE"])
+      for j, RecordDt in enumerate(Tdt):
+        bbox0 = np.array(Record0["TrackBbox"])
+        bboxdt = np.array(RecordDt["TrackBbox"])
+        bbox0_ctr = (bbox0[:2] + bbox0[2:]) / 2
+        bboxdt_ctr = (bboxdt[:2] + bboxdt[2:]) / 2
+        bbox_distance = np.linalg.norm(bbox0_ctr - bboxdt_ctr)
+        if bbox_distance < self.MaxDistance:
+          if j not in Decoded:
+            Decoded[j] = DecodeMultiRLE(RecordDt["LocalTrackRLE"])
+          Matrix[i, j] = TracksCentroidL2(LTR0, Decoded[j], dt)
+    return Matrix
+
+
+# Reference implementation (whole video in memory), kept for comparison; the entry point below does not use it.
 def GlobalAssignment_L2Distance(VideoPath, VideoShape, AnnotDF, TimeKernelSize, MaxCentroidDistance=20, MaxTimeKernelShift=None):
 
-  VideoFrames = sorted(os.listdir(VideoPath))
+  VideoFrames = ListVideoFrames(VideoPath)
   NumFrames = len(VideoFrames)
 
   if MaxTimeKernelShift is None:
@@ -85,11 +107,6 @@ def GlobalAssignment_L2Distance(VideoPath, VideoShape, AnnotDF, TimeKernelSize, 
             L2Dist = TracksCentroidL2(LTR0, LTRdt, dt)
             DistanceMatrix[i, j] = L2Dist
 
-      """
-      sns.heatmap(DistanceMatrix)
-      plt.show()
-      """
-
       # Hungarian Method based Assignment
 
       try:
@@ -107,10 +124,6 @@ def GlobalAssignment_L2Distance(VideoPath, VideoShape, AnnotDF, TimeKernelSize, 
 
       t_end = time.time()
 
-      """
-      print(f"dt {dt}, Frame {Frame}, t_full {t_end-t0} s")
-      """
-
       try:
         ProgressBar.update(progress(len(AnnotDF.query("not NextID.isnull()")), len(AnnotDF)))
       except:
@@ -126,7 +139,8 @@ def GlobalAssignment_L2Distance(VideoPath, VideoShape, AnnotDF, TimeKernelSize, 
 def SingleVideoSymmetryTracking_L2Distance(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize,
                               Color = "GRAYSCALE", Marker = "CENTROID", SegmentationConfidence = 0.1,
                               MaxCentroidDistance=20, MaxTimeKernelShift=None,
-                              FaultyObjectRemoval = True, MinObjectPixelNumber=20, MaxOverlapRatio=0.5):
+                              FaultyObjectRemoval = True, MinObjectPixelNumber=20, MaxOverlapRatio=0.5,
+                              OutputPath=None):
   """
   - VideoPath: The path to video in stardard .png images format on which the tracking will be performed
   - ModelPath: The path to the pretrained model (the full model definition, not just the state dictionary)
@@ -156,31 +170,8 @@ def SingleVideoSymmetryTracking_L2Distance(VideoPath, ModelPath, Device, AnnotPa
                       The maximal overlap allowed between annotations in the original annotation.
                       Above MaxOverlapRatio, the area-wise smaller Object will be removed.
                       Not an important parameter if the segmentation is more or less a partitioning
+  - OutputPath: as in SingleVideoSymmetryTracking
   """
-
-  if not Color in ["GRAYSCALE", "RGB"]:
-    raise Exception(f"{Color} is an invalid keyword for Color")
-  if not Marker in ["CENTROID", "BBOX"]:
-    raise Exception(f"{Marker} is not an appropriate keyword for Marker")
-
-  VideoFrames = sorted(os.listdir(VideoPath))
-  Img0 = cv2.imread(os.path.join(VideoPath,VideoFrames[0]))
-  VideoShape = [len(os.listdir(VideoPath)), np.shape(Img0)[0], np.shape(Img0)[1]]
-  AnnotDF = LoadAnnotJSON(AnnotPath)
-  AnnotDF = TransformToTrackingAnnot(AnnotDF)
-
-  if FaultyObjectRemoval:
-    AnnotDF = RemoveFaultyObjects(AnnotDF, VideoShape, MinObjectPixelNumber, MaxOverlapRatio)
-
-  Model = LoadPretrainedModel(ModelPath, Device)
-  AnnotDF = LocalTracking(VideoPath, VideoShape, AnnotDF, Model, Device, TimeKernelSize, Color, Marker, SegmentationConfidence)
-  del Model
-  gc.collect()
-
-  AnnotDF = GlobalAssignment_L2Distance(VideoPath, VideoShape, AnnotDF, TimeKernelSize, MaxCentroidDistance, MaxTimeKernelShift)
-
-  AnnotDF = ConnectedIDReduction(AnnotDF)
-  
-  AnnotDF = InterpolateMissingObjects(AnnotDF)
-
-  return AnnotDF
+  return SymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize, Color, Marker, SegmentationConfidence,
+                          CentroidL2Similarity(MaxCentroidDistance), MaxTimeKernelShift,
+                          FaultyObjectRemoval, MinObjectPixelNumber, MaxOverlapRatio, OutputPath)

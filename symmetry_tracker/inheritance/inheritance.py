@@ -1,35 +1,57 @@
-from symmetry_tracker.general_functionalities.io_utilities import LoadAnnotJSON
 import numpy as np
 
-def EuclideanInheritance(AnnotDF, MaxCentroidDistance):
-  for child_tr_id in AnnotDF["TrackID"].unique():
-    start_frame =  AnnotDF.loc[AnnotDF["TrackID"] == child_tr_id, "Frame"].min()
-    if start_frame is not AnnotDF["Frame"].min():
+from symmetry_tracker.general_functionalities.io_utilities import LoadAnnotJSON, GroupByFrame
+
+
+def EuclideanAncestors(FrameGroups, MaxCentroidDistance):
+  """Returns {TrackID: mother TrackID or None}, one entry per track, in linear time."""
+  Ancestor = {}
+  FirstFrame = None
+  for Frame, Records in FrameGroups:
+    if FirstFrame is None:
+      FirstFrame = Frame
+    Present = {}
+    for Record in Records:
+      if Record["TrackID"] not in Present:
+        Present[Record["TrackID"]] = Record["Centroid"]
+    for child_tr_id, child_ctr in Present.items():
+      if child_tr_id in Ancestor:
+        continue
       mother_tr_id = None
       min_distance = None
-      AnnotDF_Frame = AnnotDF.loc[AnnotDF["Frame"] == start_frame]
-      for mother_canditate_tr_id in AnnotDF_Frame["TrackID"].unique():
-        if mother_canditate_tr_id != child_tr_id:
-          mother_candidate_ctr = AnnotDF_Frame.loc[AnnotDF_Frame["TrackID"] == mother_canditate_tr_id, "Centroid"].iloc[0]
-          child_ctr = AnnotDF_Frame.loc[AnnotDF_Frame["TrackID"] == child_tr_id, "Centroid"].iloc[0]
-          distance = np.sqrt((mother_candidate_ctr[0] - child_ctr[0])**2 + (mother_candidate_ctr[1] - child_ctr[1])**2)
-          if distance <= MaxCentroidDistance and (min_distance is None or distance < min_distance):
-            min_distance = distance
-            mother_tr_id = mother_canditate_tr_id
-      if mother_tr_id is not None:
-        AnnotDF.loc[AnnotDF["TrackID"] == child_tr_id, "AncestorID"] = mother_tr_id
+      if Frame != FirstFrame:
+        for mother_canditate_tr_id, mother_candidate_ctr in Present.items():
+          if mother_canditate_tr_id != child_tr_id:
+            distance = np.sqrt((mother_candidate_ctr[0] - child_ctr[0])**2 + (mother_candidate_ctr[1] - child_ctr[1])**2)
+            if distance <= MaxCentroidDistance and (min_distance is None or distance < min_distance):
+              min_distance = distance
+              mother_tr_id = mother_canditate_tr_id
+      Ancestor[child_tr_id] = mother_tr_id
+  return Ancestor
+
+
+def EuclideanInheritance(AnnotDF, MaxCentroidDistance):
+  """Sets the AncestorID of every track that has a mother (see EuclideanAncestors); linear time."""
+  Rows = AnnotDF.to_dict(orient="records")
+  Ancestor = EuclideanAncestors(GroupByFrame(Rows), MaxCentroidDistance)
+  Values = []
+  for Row in Rows:
+    Mother = Ancestor.get(Row["TrackID"])
+    Values.append(Mother if Mother is not None else Row["AncestorID"])
+  AnnotDF["AncestorID"] = Values
   return AnnotDF
+
 
 def BuildInheritanceTree(VideoPath, AnnotPath, Method = "Euclidean", MaxCentroidDistance = 60):
   """
   - VideoPath: The path to the video (in .png images format)
-  - AnnotPath: The path to a single annotation (segmentation and tracking) belonging to the video at VideoPath
-  - Method: The method for inheritance prediction, the current only option is Euclidean
+  - AnnotPath: The path to the tracked annotation (json)
+  - Method: The method of inheritance tree building. For now, only Euclidean is available
   - MaxCentoidDistance: The maximal allowed distance of centroids for object inheritance assignment
   """
 
   AnnotDF = LoadAnnotJSON(AnnotPath)
-  if len(AnnotDF["TrackID"].unique()) < 1 or (len(AnnotDF["TrackID"].unique()) == 1 and AnnotDF["TrackID"].unique()[0] is None):
+  if len(AnnotDF) < 1:
     raise Exception(f"Invalid TrackIDs for inheritance detection, run tracking beforehand")
   AnnotDF["AncestorID"] = None
 
