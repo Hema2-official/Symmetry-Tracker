@@ -10,17 +10,6 @@ The frames of a video are processed in order. For frame g:
 Only the local tracks of the last 2*TimeKernelSize-1 frames and 2*TimeKernelSize+1 decoded frames are
 kept, so the memory does not grow with the length of the video, and the rows of a frame are final
 (and can be written out) MaxTimeKernelShift-1 frames later.
-
-The results are identical to those of the original whole-video implementation
-(LocalTracking + GlobalAssignment + ConnectedIDReduction + InterpolateMissingObjects):
-- a pair (f, g) reads the NextIDs of frame f, written only by the pairs (f, g') with g' < g in both
-  orders, and the PrevIDs of frame g, written only by the pairs (f', g) with f' > f in both orders,
-  so processing the pairs by their later frame instead of by dt solves every pair on the same state;
-- the within-frame order of the candidates is the input order, as before, so the assignment solver
-  breaks ties the same way;
-- ConnectedIDReduction numbers the tracks in the order of their first object, which is what the
-  online numbering does;
-- the interpolation is the same computation on the same pairs of consecutive instances.
 """
 import gc
 
@@ -30,7 +19,7 @@ from scipy.optimize import linear_sum_assignment
 
 from symmetry_tracker.general_functionalities.misc_utilities import EncodeMultiRLE, OuterBoundingBox, BoxOverlap
 from symmetry_tracker.general_functionalities.video_io import FrameSource
-from symmetry_tracker.tracking.kernel import KernelTrackCentroid, KernelTrackBbox
+from symmetry_tracker.tracking.kernel import TrackingKernel
 from symmetry_tracker.tracking.post_processing import InterpolateGap
 from symmetry_tracker.tracking.tracker_utilities import TrackingFrames, RecordCollector, LoadPretrainedModel
 
@@ -108,23 +97,18 @@ class TrackIoUSimilarity(MaximizeSimilarity):
     return Matrix
 
 
-def LocalTrackFrame(Frames, Frame, FrameRecords, Model, Device, TimeKernelSize, Marker, SegmentationConfidence):
+def LocalTrackFrame(Frames, Frame, FrameRecords, Kernel, TimeKernelSize):
   """
   The local track of every object of one frame: LocalTrackRLE, the pixel counts of its channels
-  (LocalTrackAreas) and TrackBbox. The kernel runs once per object, as in LocalTracking.
+  (LocalTrackAreas, from the encodings) and TrackBbox. The kernel runs once per object, as in LocalTracking.
   """
   if not FrameRecords:
     return
   LocalVideo = Frames.LocalVideo(Frame, TimeKernelSize)
-  for Record in FrameRecords:
-    if Marker == "CENTROID":
-      LocalTrack = KernelTrackCentroid(LocalVideo, Frames.VideoShape, Model, Device, SegmentationConfidence, Record["Centroid"])
-    elif Marker == "BBOX":
-      LocalTrack = KernelTrackBbox(LocalVideo, Frames.VideoShape, Model, Device, SegmentationConfidence, Record["SegBbox"])
-    else:
-      raise Exception(f"{Marker} is not an appropriate keyword for Marker")
+  Markers = [Record[Kernel.MarkerColumn] for Record in FrameRecords]
+  for Record, LocalTrack in zip(FrameRecords, Kernel.LocalTracks(LocalVideo, Markers)):
     Record["LocalTrackRLE"] = EncodeMultiRLE(LocalTrack)
-    Record["LocalTrackAreas"] = [int(Area) for Area in LocalTrack.sum(axis=(1, 2))]
+    Record["LocalTrackAreas"] = [int(Area) for Area in coco_mask.area(Record["LocalTrackRLE"])]
     Record["TrackBbox"] = OuterBoundingBox(LocalTrack)
 
 
@@ -153,14 +137,14 @@ def AssignFramePair(T0Records, TdtRecords, dt, Similarity):
   return Links
 
 
-def StreamingTracking(Frames, FrameGroups, Model, Device, TimeKernelSize, Marker, SegmentationConfidence, Similarity,
+def StreamingTracking(Frames, FrameGroups, Kernel, TimeKernelSize, Similarity,
                       MaxTimeKernelShift=None, OutputPath=None, ProgressCallback=None):
   """
   Runs the whole tracking stage frame by frame (see the module docstring).
 
   - Frames: a FrameSource of the video
   - FrameGroups: the (Frame, tracking rows) groups of the annotation in frame order (TrackingFrames)
-  - Model, Device, TimeKernelSize, Marker, SegmentationConfidence: the kernel parameters
+  - Kernel: the TrackingKernel of the model; TimeKernelSize: as in SingleVideoSymmetryTracking
   - Similarity: a MaximizeSimilarity or MinimizeDistance metric defining how objects of different frames are matched
   - MaxTimeKernelShift: as in SingleVideoSymmetryTracking
   - OutputPath: optional .json / .jsonl path; if given the rows are written there as they become final and None
@@ -189,7 +173,7 @@ def StreamingTracking(Frames, FrameGroups, Model, Device, TimeKernelSize, Marker
         Records = NextGroup[1]
         NextGroup = next(Groups, None)
 
-      LocalTrackFrame(Frames, Frame, Records, Model, Device, TimeKernelSize, Marker, SegmentationConfidence)
+      LocalTrackFrame(Frames, Frame, Records, Kernel, TimeKernelSize)
       Window[Frame] = Records
 
       NewLinks = []
@@ -228,16 +212,17 @@ def SymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize, Co
                      OutputPath=None):
   """
   The common body of the SingleVideoSymmetryTracking* entry points: opens the video and the annotation,
-  loads the model and runs StreamingTracking with the given Similarity. The parameters are those of
-  SingleVideoSymmetryTracking.
+  loads the model into a TrackingKernel and runs StreamingTracking with the given Similarity. The
+  parameters are those of SingleVideoSymmetryTracking.
   """
   if not Marker in ["CENTROID", "BBOX"]:
     raise Exception(f"{Marker} is not an appropriate keyword for Marker")
   Frames = FrameSource(VideoPath, Color, WindowSize=2*TimeKernelSize+2)
   Groups = TrackingFrames(AnnotPath, Frames.VideoShape, FaultyObjectRemoval, MinObjectPixelNumber, MaxOverlapRatio)
   Model = LoadPretrainedModel(ModelPath, Device)
-  Result = StreamingTracking(Frames, Groups, Model, Device, TimeKernelSize, Marker, SegmentationConfidence, Similarity,
-                             MaxTimeKernelShift, OutputPath)
-  del Model
+  Kernel = TrackingKernel(Model, Device, Frames.VideoShape, Frames.Channels, TimeKernelSize, Marker,
+                          SegmentationConfidence)
+  Result = StreamingTracking(Frames, Groups, Kernel, TimeKernelSize, Similarity, MaxTimeKernelShift, OutputPath)
+  del Kernel, Model
   gc.collect()
   return Result
