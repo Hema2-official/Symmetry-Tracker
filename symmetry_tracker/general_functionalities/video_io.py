@@ -3,7 +3,6 @@ Frame access for videos stored as a folder of images.
 
 - ListVideoFrames: the image files of a folder in frame order. Names are compared by their numeric
   runs (natural sort), so frame_10000.png comes after frame_2000.png whatever the zero padding.
-  A plain sorted(os.listdir()) put frame 10000 before frame 2000 and silently scrambled long videos.
 - FrameSource: decodes frames on demand and keeps only a small window of recently used frames, so
   the memory needed does not depend on the length of the video.
 """
@@ -77,8 +76,8 @@ class FrameSource:
   def LocalVideo(self, Frame, TimeKernelSize):
     """
     The 2*TimeKernelSize+1 frames around Frame as one (Channels*(2*TimeKernelSize+1), H, W) stack, the
-    frames beyond the ends of the video replaced by the central frame: exactly the kernel input
-    LocalTracking composed per object.
+    frames beyond the ends of the video replaced by the central frame: the kernel input LocalTracking
+    builds per object.
     """
     K, C = TimeKernelSize, self.Channels
     Stack = np.repeat(self.Get(Frame).reshape(1, C, self.Height, self.Width), 2*K+1, axis=0)

@@ -18,8 +18,8 @@ except:
 
 
 # ---------------------------------------------------------------------------------------------------
-# Reference implementation (whole video in memory). SingleVideoSymmetryTracking does not use these
-# any more; they are kept for comparison and for callers of the old step-by-step API.
+# Reference implementation (whole video in memory) and step-by-step API; SingleVideoSymmetryTracking
+# does not use it.
 # ---------------------------------------------------------------------------------------------------
 
 def LocalTracking(VideoPath, VideoShape, AnnotDF, Model, Device, TimeKernelSize, Color = "GRAYSCALE", Marker = "CENTROID", SegmentationConfidence = 0.2):
@@ -264,8 +264,8 @@ def SingleVideoSymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKer
                        "fast" (default): batch norms folded into the convolutions and mkldnn layouts
                        (torch.jit.optimize_for_inference), about 25% faster on CPU. The logits differ from the model
                        as loaded by float rounding, so a local track may differ at a pixel lying exactly at
-                       SegmentationConfidence (none did on the sample videos; the local tracks themselves are not exported).
-                       "none": the model as loaded, the reference computation.
+                       SegmentationConfidence (the local tracks themselves are not exported).
+                       "none": the model as loaded.
 
   The video is processed frame by frame with a bounded window (see streaming_tracker).
   """

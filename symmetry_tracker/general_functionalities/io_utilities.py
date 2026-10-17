@@ -2,7 +2,7 @@
 Annotation I/O.
 
 The annotation of a video is a list of records (one per object instance). Besides the DataFrame API
-(LoadAnnotJSON / ExportAnnotJSON, unchanged), records can be read one at a time (IterAnnotRecords)
+(LoadAnnotJSON / ExportAnnotJSON), records can be read one at a time (IterAnnotRecords)
 and written one at a time (AnnotWriter), so the memory needed does not depend on the video length.
 A .json file holds one JSON array, a .jsonl file one record per line. GroupByFrame and
 GroupRecordsByFrame group rows by frame, for whole annotations and for streams respectively.
@@ -144,8 +144,7 @@ def GroupRecordsByFrame(Records):
 def RecordsToDataFrame(Records, Columns):
   """
   Builds a DataFrame from row dicts in one go. Every column has object dtype and holds the Python
-  values as they are (the content the former row-by-row pd.concat produced); keys missing from a row
-  become NaN.
+  values as they are; keys missing from a row become NaN.
   """
   Data = {}
   for Column in Columns:

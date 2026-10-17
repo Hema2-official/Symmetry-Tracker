@@ -3,9 +3,8 @@ import os
 import cv2
 import numpy as np
 
-# Digits of the frame number in the file names. 8 digits keep frame_00010000.png after
-# frame_00002000.png even for a plain lexicographic sort, which the 4-digit names broke from
-# frame 10000 on. The readers sort numerically anyway (see video_io.ListVideoFrames).
+# Digits of the frame number in the file names: 8 digits keep the names in frame order for a plain
+# lexicographic sort too (the readers sort numerically, see video_io.ListVideoFrames).
 FRAME_NAME_DIGITS = 8
 
 

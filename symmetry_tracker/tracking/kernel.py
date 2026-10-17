@@ -1,22 +1,19 @@
 """
 The tracking kernel: one forward pass of the time-symmetric model per object.
 
-KernelTrackCentroid and KernelTrackBbox are the original functions, unchanged (the reference
-LocalTracking uses them). TrackingKernel, used by the streaming implementation, computes the same
-masks bit for bit with less work around the forward pass:
+KernelTrackCentroid and KernelTrackBbox compute the local track of one object (LocalTracking uses
+them). TrackingKernel, used by the streaming implementation, computes the same masks for all objects
+of a frame:
 
-- the frame stack of a frame is converted once, through a 256-entry float32 table holding
-  float32(float64(x)/255) (the values the original float64 chain produced), into a padded input
-  buffer; per object only the marker channel is written. The original built three float64 copies
-  of all 16 channels per object.
+- the frame stack is converted once per frame into a padded float32 input buffer, through a
+  256-entry table holding float32(float64(x)/255), the values KernelTrackCentroid feeds the model;
+  per object only the marker channel is written.
 - the output is sigmoid(logits) > SegmentationConfidence compared in float32.
 - by default (ModelOptimization "fast") the model is traced, frozen and optimized for inference:
   batch norms folded into the convolutions, mkldnn layouts. The logits then differ from the model
-  as loaded by float rounding (about 5e-5), so a local track may differ at a pixel sitting exactly
-  at the threshold; the local tracks are never exported, and such a pixel reaches the exported
-  tracks only through a similarity that lies within about 1e-4 of its decision threshold. None did
-  on the sample videos. "none" runs the model as loaded.
-- no torch.cuda.empty_cache() per object.
+  as loaded by float rounding (about 5e-5), so a pixel lying exactly at the threshold may flip; the
+  local tracks are not exported, so such a pixel reaches the tracks only through a similarity within
+  about 1e-4 of its decision threshold. "none" runs the model as loaded.
 """
 import warnings
 
@@ -24,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# float32(float64(x)/255) for every uint8 value x: what the original float64 chain fed the model
+# float32(float64(x)/255) for every uint8 value x: what KernelTrackCentroid feeds the model
 PIXEL_VALUES = (np.arange(256, dtype=np.float64) / 255).astype(np.float32)
 
 MODEL_OPTIMIZATIONS = ("none", "fast")
@@ -93,7 +90,7 @@ class TrackingKernel:
     """
     FrameChannels = self.Inputs[0, :self.NumFrameChannels, :self.Height, :self.Width]
     FrameChannels.copy_(torch.from_numpy(PIXEL_VALUES[LocalVideo]))
-    # the marker is drawn on the unpadded frame, so slices beyond its edge are clipped as the original's were
+    # the marker is drawn on the unpadded frame, so slices beyond its edge are clipped as in KernelTrackCentroid
     MarkerChannel = self.Inputs[0, self.NumFrameChannels, :self.Height, :self.Width]
     for MarkerValue in Markers:
       MarkerChannel.zero_()
@@ -108,7 +105,7 @@ class TrackingKernel:
 
 
 # ---------------------------------------------------------------------------------------------------
-# The original kernels, unchanged (moved here from symmetry_tracker.py); LocalTracking uses them.
+# The single-object kernels; LocalTracking uses them.
 # ---------------------------------------------------------------------------------------------------
 
 def KernelTrackCentroid(LocalVideo, VideoShape, Model, Device, SegmentationConfidence, ObjectCenter):

@@ -57,7 +57,7 @@ class CentroidL2Similarity(MinimizeDistance):
     return Matrix
 
 
-# Reference implementation (whole video in memory), kept for comparison; the entry point below does not use it.
+# Reference implementation (whole video in memory); the entry point below does not use it.
 def GlobalAssignment_L2Distance(VideoPath, VideoShape, AnnotDF, TimeKernelSize, MaxCentroidDistance=20, MaxTimeKernelShift=None):
 
   VideoFrames = ListVideoFrames(VideoPath)
