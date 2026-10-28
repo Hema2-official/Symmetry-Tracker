@@ -10,8 +10,13 @@ The frames of a video are processed in order. For frame g:
 Only the local tracks of the last 2*TimeKernelSize-1 frames and 2*TimeKernelSize+1 decoded frames are
 kept, so the memory does not grow with the length of the video, and the rows of a frame are final
 (and can be written out) MaxTimeKernelShift-1 frames later.
+
+Several similarity metrics can share step 2 (StreamingTrackingMulti): every metric gets its own copy of
+the rows of a frame, sharing the local tracks, and performs steps 3-5 on them with its own window,
+TrackIDs and output.
 """
 import gc
+from contextlib import ExitStack
 
 import numpy as np
 from pycocotools import mask as coco_mask
@@ -105,22 +110,27 @@ class TrackIoUSimilarity(MaximizeSimilarity):
     return Matrix
 
 
-def LocalTrackFrame(Frames, Frame, FrameRecords, Kernel, TimeKernelSize, Similarity=None):
+def LocalTrackFrame(Frames, Frame, FrameRecords, Kernel, TimeKernelSize, Similarities):
   """
   The local track of every object of one frame: LocalTrackRLE, the pixel counts of its channels
-  (LocalTrackAreas, from the encodings) and TrackBbox, plus what the Similarity stores on the record
-  (SimilarityMetric.Prepare). The kernel runs once per object, as in LocalTracking.
+  (LocalTrackAreas, from the encodings) and TrackBbox. The kernel runs once per object, as in
+  LocalTracking. Returns one list of the rows per Similarity: shallow copies of FrameRecords made once
+  these fields are set (so the copies share them), each with what its Similarity stores on it
+  (SimilarityMetric.Prepare).
   """
+  Copies = [[] for _ in Similarities]
   if not FrameRecords:
-    return
+    return Copies
   LocalVideo = Frames.LocalVideo(Frame, TimeKernelSize)
   Markers = [Record[Kernel.MarkerColumn] for Record in FrameRecords]
   for Record, LocalTrack in zip(FrameRecords, Kernel.LocalTracks(LocalVideo, Markers)):
     Record["LocalTrackRLE"] = EncodeMultiRLE(LocalTrack)
     Record["LocalTrackAreas"] = [int(Area) for Area in coco_mask.area(Record["LocalTrackRLE"])]
     Record["TrackBbox"] = OuterBoundingBox(LocalTrack)
-    if Similarity is not None:
-      Similarity.Prepare(Record, LocalTrack)
+    for Similarity, Records in zip(Similarities, Copies):
+      Records.append(dict(Record))
+      Similarity.Prepare(Records[-1], LocalTrack)
+  return Copies
 
 
 def AssignFramePair(T0Records, TdtRecords, dt, Similarity):
@@ -148,6 +158,43 @@ def AssignFramePair(T0Records, TdtRecords, dt, Similarity):
   return Links
 
 
+class TrackingVariant:
+  """
+  One similarity metric of a tracking pass with its linking state: its rows of the frames in the window,
+  the next new TrackID and the RecordCollector of its output. Performs steps 3-5 of the module docstring.
+  """
+
+  def __init__(self, Similarity, Collector):
+    self.Similarity = Similarity
+    self.Collector = Collector
+    self.Window = {}      # Frame -> the rows of that frame with their local tracks, for the last MaxShift frames
+    self.NextTrackID = 1
+
+  def AddFrame(self, Frame, Records, MaxTimeKernelShift):
+    """Links the rows of Frame to those of the frames before it, gives them their TrackID and interpolates the gaps."""
+    self.Window[Frame] = Records
+
+    NewLinks = []
+    for dt in range(1, min(MaxTimeKernelShift, Frame+1)):
+      NewLinks += AssignFramePair(self.Window.get(Frame-dt, []), Records, dt, self.Similarity)
+
+    for Record0, RecordDt in NewLinks:
+      RecordDt["TrackID"] = Record0["TrackID"]
+      self.Collector.AddInterpolated(InterpolateGap(Record0, RecordDt, Record0["TrackID"]))
+    for Record in Records:
+      if Record["TrackID"] is None:
+        Record["TrackID"] = self.NextTrackID
+        self.NextTrackID += 1
+    self.Collector.AddOriginals(Frame, Records)
+
+  def Evict(self, Old):
+    """Drops frame Old from the window with its local tracks and writes out the rows up to it, which are final."""
+    for Record in self.Window.pop(Old, []):
+      Record["LocalTrackRLE"] = None   # only needed while the frame is in the window
+      self.Similarity.Release(Record)
+    self.Collector.Flush(Old)
+
+
 def StreamingTracking(Frames, FrameGroups, Kernel, TimeKernelSize, Similarity,
                       MaxTimeKernelShift=None, OutputPath=None, ProgressCallback=None):
   """
@@ -162,61 +209,64 @@ def StreamingTracking(Frames, FrameGroups, Kernel, TimeKernelSize, Similarity,
                 is returned, otherwise the AnnotDF of the whole video is returned (without the local tracks)
   - ProgressCallback: optional callable(FramesDone, NumFrames)
   """
+  return StreamingTrackingMulti(Frames, FrameGroups, Kernel, TimeKernelSize, [(Similarity, OutputPath)],
+                                MaxTimeKernelShift, ProgressCallback)[0]
+
+
+def StreamingTrackingMulti(Frames, FrameGroups, Kernel, TimeKernelSize, Variants,
+                           MaxTimeKernelShift=None, ProgressCallback=None):
+  """
+  StreamingTracking for several similarity metrics with one kernel pass: the local tracks are computed
+  once per object, and every metric links its own copies of the rows (LocalTrackFrame) with its own
+  window, TrackIDs and output, so its result is that of StreamingTracking with that metric alone.
+
+  - Variants: a list of (Similarity, OutputPath) pairs, each as the Similarity and OutputPath of StreamingTracking
+  - the other parameters as in StreamingTracking
+  Returns the list of the results of the variants, in order.
+  """
   if MaxTimeKernelShift is None:
     MaxTimeKernelShift=TimeKernelSize*2
   MaxShift = MaxTimeKernelShift - 1   # the largest dt of range(1, MaxTimeKernelShift)
   NumFrames = Frames.NumFrames
+  Similarities = [Similarity for Similarity, _ in Variants]
 
   Groups = iter(FrameGroups)
   NextGroup = next(Groups, None)
-  Window = {}      # Frame -> the rows of that frame with their local tracks, for the last MaxShift frames
-  NextTrackID = 1
 
-  def Evict(Old):
-    for Record in Window.pop(Old, []):
-      Record["LocalTrackRLE"] = None   # only needed while the frame is in the window
-      Similarity.Release(Record)
+  def Label(Variant):
+    return f"{type(Variant.Similarity).__name__}: " if len(Variants) > 1 else ""
 
   print("Streaming tracking")
-  with RecordCollector(OutputPath) as Collector:
+  with ExitStack() as Stack:
+    Tracked = [TrackingVariant(Similarity, Stack.enter_context(RecordCollector(OutputPath)))
+               for Similarity, OutputPath in Variants]
     for Frame in range(NumFrames):
       Records = []
       if NextGroup is not None and NextGroup[0] == Frame:
         Records = NextGroup[1]
         NextGroup = next(Groups, None)
 
-      LocalTrackFrame(Frames, Frame, Records, Kernel, TimeKernelSize, Similarity)
-      Window[Frame] = Records
-
-      NewLinks = []
-      for dt in range(1, min(MaxTimeKernelShift, Frame+1)):
-        NewLinks += AssignFramePair(Window.get(Frame-dt, []), Records, dt, Similarity)
-
-      for Record0, RecordDt in NewLinks:
-        RecordDt["TrackID"] = Record0["TrackID"]
-        Collector.AddInterpolated(InterpolateGap(Record0, RecordDt, Record0["TrackID"]))
-      for Record in Records:
-        if Record["TrackID"] is None:
-          Record["TrackID"] = NextTrackID
-          NextTrackID += 1
-      Collector.AddOriginals(Frame, Records)
-
-      Evict(Frame - MaxShift)
-      Collector.Flush(Frame - MaxShift)
+      Copies = LocalTrackFrame(Frames, Frame, Records, Kernel, TimeKernelSize, Similarities)
+      for Variant, VariantRecords in zip(Tracked, Copies):
+        Variant.AddFrame(Frame, VariantRecords, MaxTimeKernelShift)
+        Variant.Evict(Frame - MaxShift)
 
       if ProgressCallback:
         ProgressCallback(Frame+1, NumFrames)
       if (Frame+1) % 10 == 0 or Frame+1 == NumFrames:
-        print(f"  frame {Frame+1}/{NumFrames}: {Collector.NumOriginal} objects, {NextTrackID-1} tracks, "
-              f"{Collector.NumInterpolated} interpolated")
+        for Variant in Tracked:
+          print(f"  {Label(Variant)}frame {Frame+1}/{NumFrames}: {Variant.Collector.NumOriginal} objects, "
+                f"{Variant.NextTrackID-1} tracks, {Variant.Collector.NumInterpolated} interpolated")
 
     if NextGroup is not None:
       raise ValueError(f"The annotation has objects on frame {NextGroup[0]} but the video has only {NumFrames} frames")
-    for Old in list(Window):
-      Evict(Old)
-
-    print(f"Successful interpolation of {Collector.NumInterpolated} object instances")
-    return Collector.Finish()
+    Results = []
+    for Variant in Tracked:
+      for Old in list(Variant.Window):
+        Variant.Evict(Old)
+      print(f"{Label(Variant)}Successful interpolation of {Variant.Collector.NumInterpolated} object instances")
+      Results.append(Variant.Collector.Finish())
+    return Results
 
 
 def SymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize, Color, Marker, SegmentationConfidence, Similarity,
@@ -227,6 +277,22 @@ def SymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize, Co
   loads the model into a TrackingKernel and runs StreamingTracking with the given Similarity. The
   parameters are those of SingleVideoSymmetryTracking.
   """
+  return SymmetryTrackingMulti(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize, Color, Marker,
+                               SegmentationConfidence, [(Similarity, OutputPath)], MaxTimeKernelShift,
+                               FaultyObjectRemoval, MinObjectPixelNumber, MaxOverlapRatio, ModelOptimization)[0]
+
+
+def SymmetryTrackingMulti(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize, Color, Marker, SegmentationConfidence,
+                          Variants, MaxTimeKernelShift=None, FaultyObjectRemoval=True, MinObjectPixelNumber=20,
+                          MaxOverlapRatio=0.5, ModelOptimization="fast"):
+  """
+  SymmetryTracking for several similarity metrics on the same video with one kernel pass
+  (StreamingTrackingMulti). Variants is a list of (Similarity, OutputPath) pairs; the metrics of the
+  SingleVideoSymmetryTracking* entry points are TrackIoUSimilarity(MinRequiredSimilarity),
+  CentroidL2Similarity(MaxCentroidDistance) (symmetry_tracker_l2dist) and
+  ShapeIoUSimilarity(MinRequiredSimilarity) (symmetry_tracker_shapedist). Returns the list of the results,
+  each that of the entry point of its metric; the other parameters are those of SingleVideoSymmetryTracking.
+  """
   if not Marker in ["CENTROID", "BBOX"]:
     raise Exception(f"{Marker} is not an appropriate keyword for Marker")
   Frames = FrameSource(VideoPath, Color, WindowSize=2*TimeKernelSize+2)
@@ -234,7 +300,7 @@ def SymmetryTracking(VideoPath, ModelPath, Device, AnnotPath, TimeKernelSize, Co
   Model = LoadPretrainedModel(ModelPath, Device)
   Kernel = TrackingKernel(Model, Device, Frames.VideoShape, Frames.Channels, TimeKernelSize, Marker,
                           SegmentationConfidence, ModelOptimization)
-  Result = StreamingTracking(Frames, Groups, Kernel, TimeKernelSize, Similarity, MaxTimeKernelShift, OutputPath)
+  Results = StreamingTrackingMulti(Frames, Groups, Kernel, TimeKernelSize, Variants, MaxTimeKernelShift)
   del Kernel, Model
   gc.collect()
-  return Result
+  return Results
